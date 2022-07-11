@@ -5,11 +5,13 @@ import (
 	"crypto"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"strings"
@@ -406,6 +408,18 @@ func (a *Authority) Revoke(ctx context.Context, revokeOpts *RevokeOptions) error
 		p   provisioner.Interface
 		err error
 	)
+
+	if revokeOpts.Crt == nil {
+		// Attempt to get the certificate expiry using the serial number.
+		cert, err := a.db.GetCertificate(revokeOpts.Serial)
+
+		// Revocation of a certificate not in the database may be requested, so fill in the expiry only
+		// if we can
+		if err == nil {
+			rci.ExpiresAt = cert.NotAfter
+		}
+	}
+
 	// If not mTLS nor ACME, then get the TokenID of the token.
 	if !(revokeOpts.MTLS || revokeOpts.ACME) {
 		token, err := jose.ParseSigned(revokeOpts.OTT)
@@ -470,6 +484,12 @@ func (a *Authority) Revoke(ctx context.Context, revokeOpts *RevokeOptions) error
 
 		// Save as revoked in the Db.
 		err = a.revoke(revokedCert, rci)
+
+		// Generate a new CRL so CRL requesters will always get an up-to-date CRL whenever they request it
+		err = a.GenerateCertificateRevocationList()
+		if err != nil {
+			return errs.Wrap(http.StatusInternalServerError, err, "authority.Revoke", opts...)
+		}
 	}
 	switch err {
 	case nil:
@@ -502,6 +522,118 @@ func (a *Authority) revokeSSH(crt *ssh.Certificate, rci *db.RevokedCertificateIn
 		return lca.RevokeSSH(crt, rci)
 	}
 	return a.db.Revoke(rci)
+}
+
+// GetCertificateRevocationList will return the currently generated CRL from the DB, or a not implemented
+// error if the underlying AuthDB does not support CRLs
+func (a *Authority) GetCertificateRevocationList() ([]byte, error) {
+	if a.config.CRL == nil {
+		return nil, errs.Wrap(http.StatusNotFound, errors.Errorf("Certificate Revocation Lists are not enabled"), "authority.GetCertificateRevocationList")
+	}
+
+	crlDB, ok := a.db.(db.CertificateRevocationListDB)
+	if !ok {
+		return nil, errs.Wrap(http.StatusNotImplemented, errors.Errorf("Database does not support Certificate Revocation Lists"), "authority.GetCertificateRevocationList")
+	}
+
+	crlInfo, err := crlDB.GetCRL()
+	if err != nil {
+		return nil, errs.Wrap(http.StatusInternalServerError, err, "authority.GetCertificateRevocationList")
+
+	}
+
+	if crlInfo == nil {
+		return nil, nil
+	}
+
+	return crlInfo.DER, nil
+}
+
+// GenerateCertificateRevocationList generates a DER representation of a signed CRL and stores it in the
+// database. Returns nil if CRL generation has been disabled in the config
+func (a *Authority) GenerateCertificateRevocationList() error {
+
+	if a.config.CRL == nil {
+		// CRL is disabled
+		return nil
+	}
+
+	crlDB, ok := a.db.(db.CertificateRevocationListDB)
+	if !ok {
+		return errors.Errorf("Database does not support CRL generation")
+	}
+
+	// some CAS may not implement the CRLGenerator interface, so check before we proceed
+	caCRLGenerator, ok := a.x509CAService.(casapi.CertificateAuthorityCRLGenerator)
+	if !ok {
+		return errors.Errorf("CA does not support CRL Generation")
+	}
+
+	crlInfo, err := crlDB.GetCRL()
+	if err != nil {
+		return errors.Wrap(err, "could not retrieve CRL from database")
+	}
+
+	revokedList, err := crlDB.GetRevokedCertificates()
+	if err != nil {
+		return errors.Wrap(err, "could not retrieve revoked certificates list from database")
+	}
+
+	// Number is a monotonically increasing integer (essentially the CRL version number) that we need to
+	// keep track of and increase every time we generate a new CRL
+	var n int64
+	var bn big.Int
+
+	if crlInfo != nil {
+		n = crlInfo.Number + 1
+	}
+	bn.SetInt64(n)
+
+	// Convert our database db.RevokedCertificateInfo types into the pkix representation ready for the
+	// CAS to sign it
+	var revokedCertificates []pkix.RevokedCertificate
+
+	for _, revokedCert := range *revokedList {
+		var sn big.Int
+		sn.SetString(revokedCert.Serial, 10)
+		revokedCertificates = append(revokedCertificates, pkix.RevokedCertificate{
+			SerialNumber:   &sn,
+			RevocationTime: revokedCert.RevokedAt,
+			Extensions:     nil,
+		})
+	}
+
+	// Create a RevocationList representation ready for the CAS to sign
+	// TODO: allow SignatureAlgorithm to be specified?
+	revocationList := x509.RevocationList{
+		SignatureAlgorithm:  0,
+		RevokedCertificates: revokedCertificates,
+		Number:              &bn,
+		ThisUpdate:          time.Now().UTC(),
+		NextUpdate:          time.Now().UTC().Add(a.config.CRL.CacheDuration.Duration),
+		ExtraExtensions:     nil,
+	}
+
+	certificateRevocationList, err := caCRLGenerator.CreateCRL(&casapi.CreateCRLRequest{RevocationList: &revocationList})
+	if err != nil {
+		return errors.Wrap(err, "could not create CRL")
+	}
+
+	// Create a new db.CertificateRevocationListInfo, which stores the new Number we just generated, the
+	// expiry time, and the DER-encoded CRL
+	newCRLInfo := db.CertificateRevocationListInfo{
+		Number:    n,
+		ExpiresAt: revocationList.NextUpdate,
+		DER:       certificateRevocationList.CRL,
+	}
+
+	// Store the CRL in the database ready for retrieval by api endpoints
+	err = crlDB.StoreCRL(&newCRLInfo)
+	if err != nil {
+		return errors.Wrap(err, "could not store CRL in database")
+	}
+
+	return nil
 }
 
 // GetTLSCertificate creates a new leaf certificate to be used by the CA HTTPS server.
