@@ -70,10 +70,22 @@ func TestJWK_Init(t *testing.T) {
 				err: errors.New("provisioner type cannot be empty"),
 			}
 		},
-		"fail-empty-key": func(t *testing.T) ProvisionerValidateTest {
+		"fail-empty-key-and-jwksuri": func(t *testing.T) ProvisionerValidateTest {
 			return ProvisionerValidateTest{
 				p:   &JWK{Name: "foo", Type: "bar"},
-				err: errors.New("provisioner key cannot be empty"),
+				err: errors.New("provisioner needs either JWKSUri or key defined"),
+			}
+		},
+		"fail-set-key-and-jwksuri": func(t *testing.T) ProvisionerValidateTest {
+			return ProvisionerValidateTest{
+				p:   &JWK{Name: "foo", Type: "bar", Key: &jose.JSONWebKey{}, JWKSUri: "https://example.com"},
+				err: errors.New("provisioner cannot have both JWKSUri and key defined"),
+			}
+		},
+		"fail-empty-tokenid-with-jwks": func(t *testing.T) ProvisionerValidateTest {
+			return ProvisionerValidateTest{
+				p:   &JWK{Name: "foo", Type: "bar", JWKSUri: "https://example.com"},
+				err: errors.New("provisioner needs a unique TokenID set when JWKSUri is defined"),
 			}
 		},
 		"fail-bad-claims": func(t *testing.T) ProvisionerValidateTest {

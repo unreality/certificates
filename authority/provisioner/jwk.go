@@ -34,10 +34,13 @@ type JWK struct {
 	ID           string           `json:"-"`
 	Type         string           `json:"type"`
 	Name         string           `json:"name"`
-	Key          *jose.JSONWebKey `json:"key"`
+	Key          *jose.JSONWebKey `json:"key,omitempty"`
+	JWKSUri      string           `json:"jwksUri,omitempty"`
+	TokenID      string           `json:"tokenID,omitempty"`
 	EncryptedKey string           `json:"encryptedKey,omitempty"`
 	Claims       *Claims          `json:"claims,omitempty"`
 	Options      *Options         `json:"options,omitempty"`
+	keyStore     *keyStore
 	ctl          *Controller
 }
 
@@ -53,6 +56,11 @@ func (p *JWK) GetID() string {
 // GetIDForToken returns an identifier that will be used to load the provisioner
 // from a token.
 func (p *JWK) GetIDForToken() string {
+	// We may wish to specify a specific TokenID, especially for JWKS since we
+	// won't know which KeyID to use, and they could rotate
+	if p.TokenID != "" {
+		return p.TokenID
+	}
 	return p.Name + ":" + p.Key.KeyID
 }
 
@@ -86,6 +94,9 @@ func (p *JWK) GetType() Type {
 
 // GetEncryptedKey returns the base provisioner encrypted key if it's defined.
 func (p *JWK) GetEncryptedKey() (string, string, bool) {
+	if p.JWKSUri != "" {
+		return "", "", false //If a JWKSUri is set, encrypted key is not available
+	}
 	return p.Key.KeyID, p.EncryptedKey, len(p.EncryptedKey) > 0
 }
 
@@ -96,11 +107,24 @@ func (p *JWK) Init(config Config) (err error) {
 		return errors.New("provisioner type cannot be empty")
 	case p.Name == "":
 		return errors.New("provisioner name cannot be empty")
-	case p.Key == nil:
-		return errors.New("provisioner key cannot be empty")
+	case p.Key == nil && p.JWKSUri == "":
+		return errors.New("provisioner needs either JWKSUri or key defined")
+	case p.Key != nil && p.JWKSUri != "":
+		return errors.New("provisioner cannot have both JWKSUri and key defined")
+	case p.JWKSUri != "" && p.TokenID == "":
+		return errors.New("provisioner needs a unique TokenID set when JWKSUri is defined")
 	}
 
 	p.ctl, err = NewController(p, p.Claims, config, p.Options)
+
+	if p.JWKSUri != "" {
+		// Get JWK key set
+		p.keyStore, err = newKeyStore(p.JWKSUri)
+		if err != nil {
+			return err
+		}
+	}
+
 	return
 }
 
@@ -114,7 +138,21 @@ func (p *JWK) authorizeToken(token string, audiences []string) (*jwtPayload, err
 	}
 
 	var claims jwtPayload
-	if err = jwt.Claims(p.Key, &claims); err != nil {
+
+	if p.JWKSUri != "" {
+		found := false
+		kid := jwt.Headers[0].KeyID
+		keys := p.keyStore.Get(kid)
+		for _, key := range keys {
+			if err := jwt.Claims(key, &claims); err == nil {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, errs.Unauthorized("jwk.AuthorizeToken; error parsing jwk claims")
+		}
+	} else if err = jwt.Claims(p.Key, &claims); err != nil {
 		return nil, errs.Wrap(http.StatusUnauthorized, err, "jwk.authorizeToken; error parsing jwk claims")
 	}
 
@@ -182,11 +220,18 @@ func (p *JWK) AuthorizeSign(ctx context.Context, token string) ([]SignOption, er
 		}
 	}
 
+	var extensionOption *provisionerExtensionOption
+	if p.JWKSUri != "" {
+		extensionOption = newProvisionerExtensionOption(TypeJWK, p.Name, p.JWKSUri)
+	} else {
+		extensionOption = newProvisionerExtensionOption(TypeJWK, p.Name, p.Key.KeyID)
+	}
+
 	return []SignOption{
 		self,
 		templateOptions,
 		// modifiers / withOptions
-		newProvisionerExtensionOption(TypeJWK, p.Name, p.Key.KeyID),
+		extensionOption,
 		profileDefaultDuration(p.ctl.Claimer.DefaultTLSCertDuration()),
 		// validators
 		commonNameValidator(claims.Subject),
